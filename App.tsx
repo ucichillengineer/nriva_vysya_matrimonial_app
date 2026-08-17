@@ -121,7 +121,10 @@ export default function App() {
     const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'text/json'], copyToCacheDirectory: true });
     if (result.canceled) return;
     try {
-      const text = await FileSystem.readAsStringAsync(result.assets[0].uri);
+      const asset = result.assets[0];
+      const text = Platform.OS === 'web' && asset.file
+        ? await asset.file.text()
+        : await FileSystem.readAsStringAsync(asset.uri);
       const parsed = JSON.parse(text) as ImportEnvelope;
       const incoming = parsed.profiles;
       if (!Array.isArray(incoming) || incoming.some((profile) => !profile.id || !profile.identity?.fullName)) {
