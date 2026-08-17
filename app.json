@@ -1,15 +1,17 @@
 {
   "expo": {
-    "name": "app",
-    "slug": "app",
+    "name": "Nriva Matrimonial",
+    "slug": "nriva-matrimonial",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.nriva.matrimonial"
     },
     "android": {
+      "package": "com.nriva.matrimonial",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -19,7 +21,11 @@
       "predictiveBackGestureEnabled": false
     },
     "web": {
-      "favicon": "./assets/favicon.png"
-    }
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-sharing"
+    ]
   }
 }
