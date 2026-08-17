@@ -20,6 +20,9 @@
       },
       "predictiveBackGestureEnabled": false
     },
+    "experiments": {
+      "baseUrl": "/nriva_vysya_matrimonial_app"
+    },
     "web": {
       "favicon": "./assets/favicon.png",
       "bundler": "metro"
