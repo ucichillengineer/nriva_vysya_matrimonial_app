@@ -5,6 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Image,
   Linking,
   Modal,
   Platform,
@@ -19,6 +20,7 @@ import {
   View,
 } from 'react-native';
 import * as Sharing from 'expo-sharing';
+import { recognizeImage } from './ocr';
 
 type ProfileType = 'groom' | 'bride' | 'unspecified';
 type Salary = { amount: number; currency: string; period: string; sourceText?: string } | null;
@@ -44,12 +46,13 @@ type Profile = {
   };
   contact?: { address?: string | null; phones?: { number: string; label: string }[] };
   preferences?: { partnerPreferenceText?: string | null; willingToRelocate?: boolean | null; preferredLocations?: string[] };
-  assets?: { path: string; kind: string; role: string }[];
+  assets?: { path: string; kind: string; role: string; dataUri?: string; mimeType?: string }[];
   recordMeta?: { needsReview?: boolean; notes?: string[] };
 };
 
 type ImportEnvelope = { profiles?: Profile[]; formatVersion?: number };
-type Tab = 'Profiles' | 'Matches' | 'Share' | 'Vault';
+type Tab = 'Profiles' | 'Add' | 'Matches' | 'Share' | 'Vault';
+type AttachedImage = { name: string; mimeType: string; dataUri: string };
 
 const VAULT_KEY = 'nriva.vault.v1';
 const today = new Date();
@@ -87,6 +90,49 @@ const shortSummary = (profile: Profile) => {
   ].filter(Boolean).join('\n');
 };
 
+const valueAfterLabel = (text: string, labels: string[]) => {
+  const label = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  return text.match(new RegExp(`(?:${label})\\s*[:\\-]\\s*([^\\n]+)`, 'i'))?.[1]?.trim() ?? null;
+};
+
+const normalizeDate = (value: string | null) => {
+  if (!value) return null;
+  const match = value.match(/(\d{1,2})[\/.\- ]([a-zA-Z]{3,9}|\d{1,2})[\/.\-, ](\d{2,4})/);
+  if (!match) return null;
+  const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+  const month = Number.isNaN(Number(match[2])) ? monthNames.indexOf(match[2].slice(0, 3).toLowerCase()) + 1 : Number(match[2]);
+  const year = match[3].length === 2 ? Number(`19${match[3]}`) : Number(match[3]);
+  const day = Number(match[1]);
+  return month && day <= 31 ? `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}` : null;
+};
+
+const parseProfileText = (text: string, profileType: ProfileType, images: AttachedImage[]): Profile => {
+  const name = valueAfterLabel(text, ['name', 'full name']) ?? 'Needs review';
+  const heightText = valueAfterLabel(text, ['height']);
+  const feetMatch = heightText?.match(/(\d)\s*(?:ft|feet|')\s*(\d{1,2})?/i);
+  const cmMatch = heightText?.match(/(\d{3})\s*cm/i);
+  const heightCm = cmMatch ? Number(cmMatch[1]) : feetMatch ? Math.round((Number(feetMatch[1]) * 12 + Number(feetMatch[2] ?? 0)) * 2.54) : null;
+  const phoneMatches = [...text.matchAll(/(?:\+?91[\s-]?)?[6-9]\d{9}/g)].map((match) => match[0].replace(/[^\d+]/g, ''));
+  const dateOfBirth = normalizeDate(valueAfterLabel(text, ['date of birth', 'dob']));
+  const rashi = valueAfterLabel(text, ['rashi', 'raashi']);
+  const nakshatra = valueAfterLabel(text, ['nakshatra', 'nakshatram', 'star']);
+  const gotram = valueAfterLabel(text, ['swagotram', 'gotram', 'gothram']);
+  const occupation = valueAfterLabel(text, ['occupation', 'present position', 'profession', 'job']);
+  const workLocation = valueAfterLabel(text, ['work location', 'location', 'working at']);
+  const education = valueAfterLabel(text, ['education', 'qualification']);
+  const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'profile'}-${Date.now()}`;
+  return {
+    id,
+    profileType,
+    identity: { fullName: name, dateOfBirth, birthTime: valueAfterLabel(text, ['time of birth', 'time']), birthPlace: valueAfterLabel(text, ['place of birth', 'birth place']), heightCm, community: valueAfterLabel(text, ['caste', 'community']) },
+    astrology: { rashi, nakshatra, pada: null, swagotram: gotram },
+    educationAndCareer: { education: education ? [education] : [], occupation, employer: valueAfterLabel(text, ['employer', 'organization', 'company']), workLocation, visaStatus: valueAfterLabel(text, ['visa status', 'visa']), annualSalary: null },
+    contact: { address: valueAfterLabel(text, ['address']), phones: phoneMatches.map((number) => ({ number, label: 'source document' })) },
+    assets: images.map((image, index) => ({ path: `local-media:${id}:${image.name}`, kind: 'portrait', role: index === 0 ? 'profile-photo' : 'gallery', dataUri: image.dataUri, mimeType: image.mimeType })),
+    recordMeta: { needsReview: true, notes: ['Created from uploaded text or OCR. Verify every extracted field before sharing.'] },
+  };
+};
+
 export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [tab, setTab] = useState<Tab>('Vault');
@@ -98,6 +144,10 @@ export default function App() {
   const [includeContact, setIncludeContact] = useState(false);
   const [detail, setDetail] = useState<Profile | null>(null);
   const [notice, setNotice] = useState('Import your private profiles.json to begin. Nothing is uploaded by this app.');
+  const [profileText, setProfileText] = useState('');
+  const [newProfileType, setNewProfileType] = useState<ProfileType>('groom');
+  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
+  const [ocrProgress, setOcrProgress] = useState<number | null>(null);
 
   useEffect(() => {
     AsyncStorage.getItem(VAULT_KEY).then((raw) => {
@@ -144,6 +194,83 @@ export default function App() {
     } catch (error) {
       Alert.alert('Import failed', error instanceof Error ? error.message : 'The selected file is not a valid profile package.');
     }
+  };
+
+  const readAsDataUri = async (asset: DocumentPicker.DocumentPickerAsset): Promise<AttachedImage> => {
+    const mimeType = asset.mimeType ?? 'image/jpeg';
+    if (Platform.OS === 'web' && asset.file) {
+      const dataUri = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error(`Could not read ${asset.name}.`));
+        reader.readAsDataURL(asset.file!);
+      });
+      return { name: asset.name, mimeType, dataUri };
+    }
+    const base64 = await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
+    return { name: asset.name, mimeType, dataUri: `data:${mimeType};base64,${base64}` };
+  };
+
+  const addPictures = async () => {
+    const result = await DocumentPicker.getDocumentAsync({ type: 'image/*', multiple: true, copyToCacheDirectory: true });
+    if (result.canceled) return;
+    try {
+      const images = await Promise.all(result.assets.map(readAsDataUri));
+      setAttachedImages((current) => [...current, ...images]);
+      setNotice(`${images.length} image(s) attached to the new profile. They will be embedded in the exported JSON.`);
+    } catch (error) {
+      Alert.alert('Could not add pictures', error instanceof Error ? error.message : 'Try a smaller image file.');
+    }
+  };
+
+  const runOcr = async () => {
+    if (Platform.OS !== 'web') {
+      Alert.alert('Use the web app for OCR', 'On iOS and Android, add photos and paste the biodata text. Browser OCR runs privately on your device.');
+      return;
+    }
+    const source = attachedImages[0];
+    if (!source) return Alert.alert('Add a biodata image first', 'Choose an image, then run OCR to copy readable text into the profile form.');
+    try {
+      setOcrProgress(0);
+      const blob = await fetch(source.dataUri).then((response) => response.blob());
+      const file = new File([blob], source.name, { type: source.mimeType });
+      const text = await recognizeImage(file, setOcrProgress);
+      setProfileText((current) => current ? `${current}\n\n${text}` : text);
+      setNotice('OCR text added. Review and correct it before saving the profile.');
+    } catch (error) {
+      Alert.alert('OCR could not read this image', error instanceof Error ? error.message : 'Try a clearer biodata image.');
+    } finally {
+      setOcrProgress(null);
+    }
+  };
+
+  const saveNewProfile = async () => {
+    if (!profileText.trim()) return Alert.alert('Add profile text', 'Paste biodata text or run OCR, then review it before saving.');
+    const profile = parseProfileText(profileText, newProfileType, attachedImages);
+    await saveVault([...profiles, profile]);
+    setSelectedIds((current) => [...current, profile.id]);
+    setProfileText('');
+    setAttachedImages([]);
+    setNotice(`${profile.identity.fullName} was saved locally. It is selected and ready to share after review.`);
+    setTab('Profiles');
+  };
+
+  const exportVault = async () => {
+    const payload = { databaseVersion: 2, exportedAt: new Date().toISOString(), privacy: { classification: 'private' }, profiles };
+    const filename = `nriva-vault-${Date.now()}.json`;
+    if (Platform.OS === 'web') {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setNotice('Full private vault downloaded. Keep this file secure because it can include embedded pictures and contact details.');
+      return;
+    }
+    const uri = `${FileSystem.cacheDirectory}${filename}`;
+    await FileSystem.writeAsStringAsync(uri, JSON.stringify(payload, null, 2));
+    await Sharing.shareAsync(uri, { mimeType: 'application/json', dialogTitle: 'Export private matrimonial vault' });
   };
 
   const exportSelection = async () => {
@@ -235,7 +362,7 @@ export default function App() {
         <Text style={styles.tagline}>Private matrimonial matching</Text>
       </View>
       <View style={styles.tabs}>
-        {(['Profiles', 'Matches', 'Share', 'Vault'] as Tab[]).map((item) => (
+        {(['Profiles', 'Add', 'Matches', 'Share', 'Vault'] as Tab[]).map((item) => (
           <Pressable key={item} onPress={() => setTab(item)} style={[styles.tab, tab === item && styles.tabActive]}>
             <Text style={[styles.tabText, tab === item && styles.tabTextActive]}>{item}</Text>
           </Pressable>
@@ -252,6 +379,7 @@ export default function App() {
               <Stat label="Brides" value={profiles.filter((p) => p.profileType === 'bride').length} />
             </View>
             <Action label="Import profiles or a share package" onPress={importVault} />
+            <Action label="Export complete private vault" onPress={exportVault} secondary disabled={!profiles.length} />
             <Text style={styles.hint}>Import your existing private `data/private/profiles.json` on each device. The app stores it locally and does not sync it to GitHub Pages.</Text>
           </View>
         )}
@@ -268,6 +396,22 @@ export default function App() {
             {visibleProfiles.map((profile) => (
               <ProfileCard key={profile.id} profile={profile} selected={selectedIds.includes(profile.id)} onToggle={() => toggleSelected(profile.id)} onOpen={() => setDetail(profile)} />
             ))}
+          </View>
+        )}
+
+        {tab === 'Add' && (
+          <View style={styles.stack}>
+            <Text style={styles.title}>Add a profile</Text>
+            <Text style={styles.body}>Paste biodata text, upload a biodata image, or do both. OCR runs in your web browser; review every field before saving.</Text>
+            <View style={styles.filterRow}>
+              {(['groom', 'bride'] as const).map((type) => <Pill key={type} label={type} active={newProfileType === type} onPress={() => setNewProfileType(type)} />)}
+            </View>
+            <Action label="Add biodata or profile pictures" onPress={addPictures} secondary />
+            <Action label={ocrProgress === null ? 'Run OCR on first image' : `Reading image… ${ocrProgress}%`} onPress={runOcr} disabled={ocrProgress !== null || !attachedImages.length} />
+            {!!attachedImages.length && <ScrollView horizontal contentContainerStyle={styles.imageRow}>{attachedImages.map((image) => <Image key={`${image.name}-${image.dataUri.length}`} source={{ uri: image.dataUri }} style={styles.thumbnail} />)}</ScrollView>}
+            <TextInput value={profileText} onChangeText={setProfileText} placeholder={'Paste biodata, for example:\nName: ...\nDOB: ...\nHeight: ...\nRashi: ...\nGotram: ...\nOccupation: ...'} multiline textAlignVertical="top" style={styles.textArea} />
+            <Action label="Review text and save profile" onPress={saveNewProfile} disabled={!profileText.trim()} />
+            <Text style={styles.hint}>Uploaded photos are embedded in this device’s vault and in its JSON export. Large photos can exceed browser storage; add a small number of compressed images per profile.</Text>
           </View>
         )}
 
@@ -361,6 +505,9 @@ const styles = StyleSheet.create({
   actionText: { color: '#fff', fontWeight: '800' },
   actionTextSecondary: { color: '#7c2d62' },
   input: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#dfd1d5', borderRadius: 10, padding: 12, fontSize: 15 },
+  textArea: { minHeight: 220, backgroundColor: '#fff', borderWidth: 1, borderColor: '#dfd1d5', borderRadius: 10, padding: 12, fontSize: 15, lineHeight: 21 },
+  imageRow: { gap: 9, paddingVertical: 2 },
+  thumbnail: { width: 86, height: 106, borderRadius: 8, backgroundColor: '#eee' },
   filterRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
   pill: { paddingHorizontal: 12, paddingVertical: 7, borderRadius: 18, backgroundColor: '#efe7e9' },
   pillActive: { backgroundColor: '#6c2856' },
